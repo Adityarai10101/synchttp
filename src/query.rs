@@ -2,144 +2,51 @@ use std::borrow::Cow;
 
 use crate::Request;
 
-/// Iterator over the percent-decoded `name=value` pairs of a request's query string.
-///
-/// Created by [`query_pairs`].
-pub struct QueryPairs<'a> {
-    remaining: &'a str,
-}
-
 /// Returns an iterator over the percent-decoded `name=value` pairs in the
 /// request's query string.
 ///
 /// Decoding follows the `application/x-www-form-urlencoded` rules that browsers
-/// and HTTP clients apply to query strings: `%XX` escapes are decoded and `+` is
-/// decoded as a space. Empty segments are skipped, and a segment without `=`
-/// yields an empty value. Bytes that do not form valid UTF-8 after decoding are
-/// replaced with U+FFFD rather than reported as an error.
-///
-/// No allocation happens for values that contain no `%` or `+`.
+/// and HTTP clients apply to query strings: `%XX` escapes are decoded and `+`
+/// becomes a space. Empty segments are skipped, a segment without `=` yields an
+/// empty value, malformed escapes are passed through unchanged, and bytes that
+/// are not valid UTF-8 once decoded are replaced with U+FFFD.
 ///
 /// Note the `+` rule: a value that must carry a literal `+` — a timestamp with a
-/// `+01:00` UTC offset, for instance — has to arrive as `%2B`, or it will decode
-/// to a space.
+/// `+01:00` UTC offset, for instance — has to arrive as `%2B`, or it decodes to a
+/// space.
 ///
 /// ```
-/// # fn main() {
 /// # let mut request = synchttp::Request::new(Vec::new());
 /// # *request.uri_mut() = "/search?q=hello+world&page=2".parse().unwrap();
 /// let pairs: Vec<_> = synchttp::query_pairs(&request).collect();
-/// assert_eq!(pairs[0].0, "q");
-/// assert_eq!(pairs[0].1, "hello world");
-/// assert_eq!(pairs[1].1, "2");
-/// # }
+/// assert_eq!(pairs[0], ("q".into(), "hello world".into()));
+/// assert_eq!(pairs[1], ("page".into(), "2".into()));
 /// ```
-pub fn query_pairs(request: &Request) -> QueryPairs<'_> {
-    QueryPairs {
-        remaining: request.uri().query().unwrap_or(""),
-    }
+pub fn query_pairs<'a>(
+    request: &'a Request,
+) -> impl Iterator<Item = (Cow<'a, str>, Cow<'a, str>)> + 'a {
+    form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes())
 }
 
-/// Returns the percent-decoded value of the first query parameter named `name`.
+/// Returns the percent-decoded value of the first query parameter named `name`,
+/// decoded as described on [`query_pairs`].
 ///
-/// Decoding rules are the same as [`query_pairs`]. Returns `None` when the
-/// request has no query string or no parameter with that name; returns
-/// `Some("")` for a parameter that is present but empty.
+/// `None` means the request has no query string or no parameter with that name.
+/// A parameter that is present but empty gives `Some("")`.
 ///
 /// ```
-/// # fn main() {
 /// # let mut request = synchttp::Request::new(Vec::new());
 /// # *request.uri_mut() = "/events?since=2026-02-05T12%3A34%3A56Z".parse().unwrap();
-/// let since = synchttp::query_param(&request, "since").unwrap();
-/// assert_eq!(since, "2026-02-05T12:34:56Z");
+/// assert_eq!(
+///     synchttp::query_param(&request, "since").unwrap(),
+///     "2026-02-05T12:34:56Z",
+/// );
 /// assert!(synchttp::query_param(&request, "missing").is_none());
-/// # }
 /// ```
 pub fn query_param<'a>(request: &'a Request, name: &str) -> Option<Cow<'a, str>> {
     query_pairs(request)
         .find(|(key, _)| key == name)
         .map(|(_, value)| value)
-}
-
-impl<'a> Iterator for QueryPairs<'a> {
-    type Item = (Cow<'a, str>, Cow<'a, str>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.remaining.is_empty() {
-                return None;
-            }
-
-            let segment = match self.remaining.find('&') {
-                Some(index) => {
-                    let (segment, rest) = self.remaining.split_at(index);
-                    self.remaining = &rest[1..];
-                    segment
-                }
-                None => std::mem::take(&mut self.remaining),
-            };
-
-            if segment.is_empty() {
-                continue;
-            }
-
-            let (name, value) = match segment.find('=') {
-                Some(index) => (&segment[..index], &segment[index + 1..]),
-                None => (segment, ""),
-            };
-
-            return Some((decode(name), decode(value)));
-        }
-    }
-}
-
-fn decode(input: &str) -> Cow<'_, str> {
-    if !input.bytes().any(|byte| byte == b'%' || byte == b'+') {
-        return Cow::Borrowed(input);
-    }
-
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                match (hex_value(bytes[index + 1]), hex_value(bytes[index + 2])) {
-                    (Some(high), Some(low)) => {
-                        out.push(high << 4 | low);
-                        index += 3;
-                    }
-                    _ => {
-                        out.push(b'%');
-                        index += 1;
-                    }
-                }
-            }
-            byte => {
-                out.push(byte);
-                index += 1;
-            }
-        }
-    }
-
-    Cow::Owned(match String::from_utf8(out) {
-        Ok(text) => text,
-        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
-    })
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -161,91 +68,59 @@ mod tests {
     }
 
     #[test]
-    fn decodes_percent_encoded_value() {
-        let request = request("/events?since=2026-02-05T12%3A34%3A56Z");
+    fn decodes_query_pairs() {
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            ("/search", &[]),
+            ("/search?q=plain", &[("q", "plain")]),
+            ("/search?q=1&page=2", &[("q", "1"), ("page", "2")]),
+            // `%XX` escapes, in names as well as values.
+            (
+                "/events?since=2026-02-05T12%3A34%3A56Z",
+                &[("since", "2026-02-05T12:34:56Z")],
+            ),
+            ("/search?sort%5Fby=name", &[("sort_by", "name")]),
+            // `+` is a space.
+            ("/search?q=a+b", &[("q", "a b")]),
+            // Present-but-empty, and no `=` at all.
+            ("/search?q=", &[("q", "")]),
+            ("/search?verbose", &[("verbose", "")]),
+            // Empty segments are skipped.
+            ("/search?&q=1&&page=2&", &[("q", "1"), ("page", "2")]),
+            // Malformed escapes pass through unchanged.
+            ("/search?q=%", &[("q", "%")]),
+            ("/search?q=%2", &[("q", "%2")]),
+            ("/search?q=%zz", &[("q", "%zz")]),
+            ("/search?q=100%25x", &[("q", "100%x")]),
+            // Bytes that are not valid UTF-8 once decoded are replaced.
+            ("/search?q=%FF", &[("q", "\u{fffd}")]),
+        ];
 
-        assert_eq!(
-            query_param(&request, "since").unwrap(),
-            "2026-02-05T12:34:56Z"
-        );
+        for (uri, expected) in cases {
+            let expected: Vec<(String, String)> = expected
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(pairs(uri), expected, "uri: {uri}");
+        }
     }
 
     #[test]
-    fn decodes_plus_as_space() {
-        assert_eq!(pairs("/search?q=a+b"), vec![("q".into(), "a b".into())]);
-    }
-
-    #[test]
-    fn borrows_when_nothing_to_decode() {
-        let request = request("/search?q=plain");
-
-        assert!(matches!(query_param(&request, "q"), Some(Cow::Borrowed(_))));
-    }
-
-    #[test]
-    fn returns_none_without_query_string() {
-        assert!(query_param(&request("/search"), "q").is_none());
-        assert_eq!(pairs("/search"), Vec::new());
-    }
-
-    #[test]
-    fn returns_none_for_missing_parameter() {
-        assert!(query_param(&request("/search?page=1"), "q").is_none());
-    }
-
-    #[test]
-    fn distinguishes_empty_value_from_missing() {
-        let request = request("/search?q=");
-
-        assert_eq!(query_param(&request, "q").unwrap(), "");
-    }
-
-    #[test]
-    fn parameter_without_equals_has_empty_value() {
-        assert_eq!(
-            pairs("/search?verbose"),
-            vec![("verbose".into(), String::new())]
-        );
-    }
-
-    #[test]
-    fn skips_empty_segments() {
-        assert_eq!(
-            pairs("/search?&q=1&&page=2&"),
-            vec![("q".into(), "1".into()), ("page".into(), "2".into())]
-        );
-    }
-
-    #[test]
-    fn first_occurrence_wins() {
+    fn query_param_takes_the_first_match() {
         let request = request("/search?q=first&q=second");
 
         assert_eq!(query_param(&request, "q").unwrap(), "first");
     }
 
     #[test]
-    fn decodes_encoded_names() {
-        let request = request("/search?sort%5Fby=name");
-
-        assert_eq!(query_param(&request, "sort_by").unwrap(), "name");
+    fn query_param_is_none_when_absent() {
+        assert!(query_param(&request("/search"), "q").is_none());
+        assert!(query_param(&request("/search?page=1"), "q").is_none());
     }
 
     #[test]
-    fn passes_through_malformed_escapes() {
-        assert_eq!(pairs("/search?q=%"), vec![("q".into(), "%".into())]);
-        assert_eq!(pairs("/search?q=%2"), vec![("q".into(), "%2".into())]);
-        assert_eq!(pairs("/search?q=%zz"), vec![("q".into(), "%zz".into())]);
-        assert_eq!(
-            pairs("/search?q=100%25x"),
-            vec![("q".into(), "100%x".into())]
-        );
-    }
+    fn query_param_borrows_when_nothing_to_decode() {
+        let request = request("/search?q=plain");
 
-    #[test]
-    fn replaces_invalid_utf8() {
-        assert_eq!(
-            pairs("/search?q=%FF"),
-            vec![("q".into(), "\u{fffd}".into())]
-        );
+        assert!(matches!(query_param(&request, "q"), Some(Cow::Borrowed(_))));
     }
 }
