@@ -539,6 +539,103 @@ fn keeps_connections_alive_for_pipelined_requests() {
     assert_eq!(response.matches("HTTP/1.1 200 OK").count(), 2);
 }
 
+/// Requests a large body, reads a little of it, then drops the socket while
+/// received data is still unread. The kernel answers a close with unread data by
+/// sending RST rather than FIN, so the server's next read or write on that
+/// connection fails with a real I/O error.
+fn reset_mid_response(address: &str) {
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .write_all(b"GET /large HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .unwrap();
+    stream.flush().unwrap();
+
+    let mut scratch = [0u8; 64];
+    stream.read_exact(&mut scratch).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    drop(stream);
+    thread::sleep(Duration::from_millis(100));
+}
+
+fn large_body_router() -> Router {
+    let body = vec![b'x'; 8 * 1024 * 1024];
+    Router::new()
+        .get("/large", move |_req| {
+            bytes_response(StatusCode::OK, body.clone())
+        })
+        .get("/health", |_req| text_response(StatusCode::OK, "ok"))
+}
+
+#[test]
+fn connection_reset_mid_response_leaves_the_server_serving() {
+    let server = spawn_server(large_body_router());
+
+    reset_mid_response(server.address());
+
+    let response = raw_http_exchange(
+        server.address(),
+        b"GET /health HTTP/1.1\r\nHost: example.test\r\n\r\n",
+    );
+
+    assert!(response_text(&response).starts_with("HTTP/1.1 200 OK\r\n"));
+}
+
+#[test]
+fn many_resets_do_not_exhaust_connection_slots() {
+    let server = spawn_server(large_body_router());
+
+    for _ in 0..5 {
+        reset_mid_response(server.address());
+    }
+
+    let response = raw_http_exchange(
+        server.address(),
+        b"GET /health HTTP/1.1\r\nHost: example.test\r\n\r\n",
+    );
+
+    assert!(response_text(&response).starts_with("HTTP/1.1 200 OK\r\n"));
+}
+
+fn panicking_router() -> Router {
+    Router::new()
+        .get("/panic", |_req| -> Response { panic!("handler exploded") })
+        .get("/health", |_req| text_response(StatusCode::OK, "ok"))
+}
+
+#[test]
+fn panicking_handler_returns_500_and_keeps_serving() {
+    let server = spawn_server(panicking_router());
+
+    let response = raw_http_exchange(
+        server.address(),
+        b"GET /panic HTTP/1.1\r\nHost: example.test\r\n\r\n",
+    );
+    let response = response_text(&response);
+    assert!(response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+    assert!(response.contains("connection: close\r\n"));
+
+    let response = raw_http_exchange(
+        server.address(),
+        b"GET /health HTTP/1.1\r\nHost: example.test\r\n\r\n",
+    );
+
+    assert!(response_text(&response).starts_with("HTTP/1.1 200 OK\r\n"));
+}
+
+#[test]
+fn handler_panic_does_not_serve_pipelined_requests_on_that_connection() {
+    let server = spawn_server(panicking_router());
+
+    let response = raw_http_exchange(
+        server.address(),
+        b"GET /panic HTTP/1.1\r\nHost: example.test\r\n\r\nGET /health HTTP/1.1\r\nHost: example.test\r\n\r\n",
+    );
+    let response = response_text(&response);
+
+    assert_eq!(response.matches("HTTP/1.1 500").count(), 1);
+    assert!(!response.contains("HTTP/1.1 200 OK"));
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 

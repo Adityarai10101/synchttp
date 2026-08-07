@@ -1,5 +1,6 @@
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::panic::{self, AssertUnwindSafe};
 
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
@@ -9,7 +10,7 @@ use crate::parse::try_parse_request;
 use crate::response::{encode_response, text_response};
 use crate::router::Handler;
 use crate::types::{ParseError, ServerConfig};
-use crate::{Method, Version};
+use crate::{Method, StatusCode, Version};
 
 const LISTENER_TOKEN: Token = Token(0);
 
@@ -93,37 +94,54 @@ impl Server {
                 }
 
                 let index = token.0.saturating_sub(1);
-                if index >= connections.len() || connections[index].is_none() {
+                if index >= connections.len() {
                     continue;
                 }
 
-                let mut remove_connection = false;
-
-                if readable {
-                    if let Some(connection) = connections[index].as_mut() {
-                        self.read_from_connection(connection, &mut handler)?;
-                    }
-                }
-
-                if writable {
-                    if let Some(connection) = connections[index].as_mut() {
-                        self.flush_connection(connection)?;
-                    }
-                }
-
-                if let Some(connection) = connections[index].as_ref() {
-                    remove_connection = connection.saw_eof && !connection.has_pending_write();
-                    remove_connection |=
-                        connection.close_after_flush && !connection.has_pending_write();
-                }
-
-                if remove_connection {
-                    self.remove_connection(index, &mut connections, &mut free_slots)?;
-                } else if let Some(connection) = connections[index].as_mut() {
-                    self.reregister_connection(index, connection)?;
+                if self.service_connection(
+                    index,
+                    readable,
+                    writable,
+                    &mut connections,
+                    &mut handler,
+                ) {
+                    self.remove_connection(index, &mut connections, &mut free_slots);
                 }
             }
         }
+    }
+
+    /// Services one ready connection, returning `true` when it should be closed
+    /// — either because it is finished or because it failed. An I/O error belongs
+    /// to a single connection and never stops the server.
+    fn service_connection<H>(
+        &self,
+        index: usize,
+        readable: bool,
+        writable: bool,
+        connections: &mut [Option<Connection>],
+        handler: &mut H,
+    ) -> bool
+    where
+        H: Handler,
+    {
+        let Some(connection) = connections[index].as_mut() else {
+            return false;
+        };
+
+        if readable && self.read_from_connection(connection, handler).is_err() {
+            return true;
+        }
+
+        if writable && self.flush_connection(connection).is_err() {
+            return true;
+        }
+
+        if (connection.saw_eof || connection.close_after_flush) && !connection.has_pending_write() {
+            return true;
+        }
+
+        self.reregister_connection(index, connection).is_err()
     }
 
     fn accept_connections(
@@ -140,13 +158,20 @@ impl Server {
                     });
 
                     let token = Token(index + 1);
-                    self.poll
+                    if self
+                        .poll
                         .registry()
-                        .register(&mut socket, token, Interest::READABLE)?;
+                        .register(&mut socket, token, Interest::READABLE)
+                        .is_err()
+                    {
+                        free_slots.push(index);
+                        continue;
+                    }
+
                     connections[index] =
                         Some(Connection::new(socket, self.config.read_buffer_capacity));
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if is_recoverable_accept_error(&error) => return Ok(()),
                 Err(error) => return Err(error),
             }
         }
@@ -215,13 +240,27 @@ impl Server {
                     let method = parsed.request.method().clone();
                     let version = parsed.request.version();
                     let close_connection = parsed.connection_close;
-                    let response = handler.handle(parsed.request);
 
-                    let bytes = encode_response(version, &method, close_connection, response);
+                    // A panicking handler must not take the server thread with
+                    // it. The handler keeps its state across requests, so after
+                    // an unwind that state has to be assumed inconsistent: the
+                    // client gets a 500 and the connection is closed rather than
+                    // having more requests pipelined onto it. The panic hook
+                    // still runs, so the message and location reach stderr.
+                    let outcome =
+                        panic::catch_unwind(AssertUnwindSafe(|| handler.handle(parsed.request)));
+
+                    let panicked = outcome.is_err();
+                    let response = outcome.unwrap_or_else(|_| {
+                        text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+                    });
+
+                    let close = close_connection || panicked;
+                    let bytes = encode_response(version, &method, close, response);
                     connection.queue_write(bytes);
-                    connection.close_after_flush |= close_connection;
+                    connection.close_after_flush |= close;
 
-                    if close_connection {
+                    if close {
                         connection.read_buf.clear();
                         break;
                     }
@@ -270,12 +309,14 @@ impl Server {
         index: usize,
         connections: &mut [Option<Connection>],
         free_slots: &mut Vec<usize>,
-    ) -> io::Result<()> {
+    ) {
         if let Some(mut connection) = connections[index].take() {
-            self.poll.registry().deregister(&mut connection.socket)?;
+            // Dropping the socket closes its file descriptor, which removes it
+            // from the poll registry, so a failed deregister leaves nothing to
+            // clean up and nothing actionable to report.
+            let _ = self.poll.registry().deregister(&mut connection.socket);
             free_slots.push(index);
         }
-        Ok(())
     }
 
     fn reregister_connection(&self, index: usize, connection: &mut Connection) -> io::Result<()> {
@@ -305,4 +346,17 @@ impl Server {
             text_response(error.status_code(), body),
         )
     }
+}
+
+/// `WouldBlock` means the backlog is drained; the rest reflect one failed
+/// connection attempt rather than a broken listener. Anything else is treated as
+/// server-fatal.
+fn is_recoverable_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::WouldBlock
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::Interrupted
+    )
 }
