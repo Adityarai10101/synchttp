@@ -1,5 +1,7 @@
+use std::any::Any;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::panic::{self, AssertUnwindSafe};
 
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
@@ -8,16 +10,19 @@ use crate::conn::Connection;
 use crate::parse::try_parse_request;
 use crate::response::{encode_response, text_response};
 use crate::router::Handler;
-use crate::types::{ParseError, ServerConfig};
-use crate::{Method, Version};
+use crate::types::{ErrorSource, ParseError, ServerConfig};
+use crate::{Method, StatusCode, Version};
 
 const LISTENER_TOKEN: Token = Token(0);
+
+type ErrorHandler = Box<dyn FnMut(ErrorSource, &io::Error) + Send>;
 
 pub struct Server {
     listener: TcpListener,
     poll: Poll,
     events: Events,
     config: ServerConfig,
+    on_error: Option<ErrorHandler>,
 }
 
 impl Server {
@@ -39,11 +44,33 @@ impl Server {
             poll,
             events: Events::with_capacity(1024),
             config: ServerConfig::default(),
+            on_error: None,
         })
     }
 
     pub fn with_config(mut self, config: ServerConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Registers a callback invoked for each non-fatal error the server recovers
+    /// from, including handler panics.
+    ///
+    /// An error on one connection is connection-fatal, not server-fatal: that
+    /// connection is closed and the server keeps serving everyone else. Such
+    /// errors are routine — a client resetting mid-response produces one — so
+    /// they are discarded unless a callback is registered here.
+    ///
+    /// The callback runs on the server thread, in the middle of the event loop,
+    /// and must not block or panic.
+    ///
+    /// Errors that are genuinely server-fatal are not passed here; they are
+    /// returned from [`serve`](Self::serve) instead.
+    pub fn on_error<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(ErrorSource, &io::Error) + Send + 'static,
+    {
+        self.on_error = Some(Box::new(callback));
         self
     }
 
@@ -101,26 +128,40 @@ impl Server {
 
                 if readable {
                     if let Some(connection) = connections[index].as_mut() {
-                        self.read_from_connection(connection, &mut handler)?;
+                        if let Err(error) = self.read_from_connection(connection, &mut handler) {
+                            self.report_error(ErrorSource::Read, &error);
+                            remove_connection = true;
+                        }
                     }
                 }
 
-                if writable {
+                if writable && !remove_connection {
                     if let Some(connection) = connections[index].as_mut() {
-                        self.flush_connection(connection)?;
+                        if let Err(error) = self.flush_connection(connection) {
+                            self.report_error(ErrorSource::Write, &error);
+                            remove_connection = true;
+                        }
                     }
                 }
 
-                if let Some(connection) = connections[index].as_ref() {
-                    remove_connection = connection.saw_eof && !connection.has_pending_write();
-                    remove_connection |=
-                        connection.close_after_flush && !connection.has_pending_write();
+                if !remove_connection {
+                    if let Some(connection) = connections[index].as_ref() {
+                        remove_connection = (connection.saw_eof || connection.close_after_flush)
+                            && !connection.has_pending_write();
+                    }
+                }
+
+                if !remove_connection {
+                    if let Some(connection) = connections[index].as_mut() {
+                        if let Err(error) = self.reregister_connection(index, connection) {
+                            self.report_error(ErrorSource::Register, &error);
+                            remove_connection = true;
+                        }
+                    }
                 }
 
                 if remove_connection {
-                    self.remove_connection(index, &mut connections, &mut free_slots)?;
-                } else if let Some(connection) = connections[index].as_mut() {
-                    self.reregister_connection(index, connection)?;
+                    self.remove_connection(index, &mut connections, &mut free_slots);
                 }
             }
         }
@@ -132,7 +173,8 @@ impl Server {
         free_slots: &mut Vec<usize>,
     ) -> io::Result<()> {
         loop {
-            match self.listener.accept() {
+            let accepted = self.listener.accept();
+            match accepted {
                 Ok((mut socket, _peer_addr)) => {
                     let index = free_slots.pop().unwrap_or_else(|| {
                         connections.push(None);
@@ -140,20 +182,31 @@ impl Server {
                     });
 
                     let token = Token(index + 1);
-                    self.poll
-                        .registry()
-                        .register(&mut socket, token, Interest::READABLE)?;
+                    let registered =
+                        self.poll
+                            .registry()
+                            .register(&mut socket, token, Interest::READABLE);
+                    if let Err(error) = registered {
+                        self.report_error(ErrorSource::Register, &error);
+                        free_slots.push(index);
+                        continue;
+                    }
+
                     connections[index] =
                         Some(Connection::new(socket, self.config.read_buffer_capacity));
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if is_transient_accept_error(&error) => {
+                    self.report_error(ErrorSource::Accept, &error);
+                    return Ok(());
+                }
                 Err(error) => return Err(error),
             }
         }
     }
 
     fn read_from_connection<H>(
-        &self,
+        &mut self,
         connection: &mut Connection,
         handler: &mut H,
     ) -> io::Result<()>
@@ -204,7 +257,7 @@ impl Server {
         Ok(())
     }
 
-    fn process_requests<H>(&self, connection: &mut Connection, handler: &mut H)
+    fn process_requests<H>(&mut self, connection: &mut Connection, handler: &mut H)
     where
         H: Handler,
     {
@@ -215,13 +268,34 @@ impl Server {
                     let method = parsed.request.method().clone();
                     let version = parsed.request.version();
                     let close_connection = parsed.connection_close;
-                    let response = handler.handle(parsed.request);
 
-                    let bytes = encode_response(version, &method, close_connection, response);
+                    // A panicking handler must not take the server thread with
+                    // it. The handler keeps its state across requests, so after
+                    // an unwind that state has to be assumed inconsistent: the
+                    // client gets a 500 and the connection is closed rather than
+                    // pipelining more requests onto it.
+                    let outcome =
+                        panic::catch_unwind(AssertUnwindSafe(|| handler.handle(parsed.request)));
+
+                    let panicked = outcome.is_err();
+                    let response = match outcome {
+                        Ok(response) => response,
+                        Err(payload) => {
+                            let error = io::Error::other(panic_message(payload.as_ref()));
+                            self.report_error(ErrorSource::Handler, &error);
+                            text_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "internal server error",
+                            )
+                        }
+                    };
+
+                    let close = close_connection || panicked;
+                    let bytes = encode_response(version, &method, close, response);
                     connection.queue_write(bytes);
-                    connection.close_after_flush |= close_connection;
+                    connection.close_after_flush |= close;
 
-                    if close_connection {
+                    if close {
                         connection.read_buf.clear();
                         break;
                     }
@@ -265,17 +339,25 @@ impl Server {
         Ok(())
     }
 
+    fn report_error(&mut self, source: ErrorSource, error: &io::Error) {
+        if let Some(callback) = self.on_error.as_mut() {
+            callback(source, error);
+        }
+    }
+
     fn remove_connection(
         &self,
         index: usize,
         connections: &mut [Option<Connection>],
         free_slots: &mut Vec<usize>,
-    ) -> io::Result<()> {
+    ) {
         if let Some(mut connection) = connections[index].take() {
-            self.poll.registry().deregister(&mut connection.socket)?;
+            // Dropping the socket closes its file descriptor, which removes it
+            // from the poll registry, so a failed deregister leaves nothing to
+            // clean up and nothing actionable to report.
+            let _ = self.poll.registry().deregister(&mut connection.socket);
             free_slots.push(index);
         }
-        Ok(())
     }
 
     fn reregister_connection(&self, index: usize, connection: &mut Connection) -> io::Result<()> {
@@ -305,4 +387,25 @@ impl Server {
             text_response(error.status_code(), body),
         )
     }
+}
+
+/// Recovers the message from a panic payload, which is a `String` for a
+/// formatted `panic!` and a `&'static str` for a literal one.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        format!("handler panicked: {message}")
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        format!("handler panicked: {message}")
+    } else {
+        "handler panicked".to_string()
+    }
+}
+
+/// Accept errors that reflect one failed connection attempt rather than a broken
+/// listener. These are reported and skipped; anything else is server-fatal.
+fn is_transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::Interrupted
+    )
 }

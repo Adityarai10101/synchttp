@@ -21,6 +21,28 @@ impl ParseError {
     }
 }
 
+/// The operation that produced a non-fatal error passed to
+/// [`Server::on_error`](crate::Server::on_error).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorSource {
+    /// Accepting a new connection from the listener failed. The listener stays
+    /// open.
+    Accept,
+    /// Registering or re-registering a connection with the poll registry
+    /// failed. The connection is closed.
+    Register,
+    /// Reading from a connection failed. The connection is closed.
+    Read,
+    /// Writing to a connection failed. The connection is closed, discarding any
+    /// response bytes still queued for it.
+    Write,
+    /// A handler panicked. The client receives a `500`, the connection is
+    /// closed, and the server keeps running. The reported error carries the
+    /// panic message; the panic hook still runs, so the location and any
+    /// backtrace go to stderr as usual.
+    Handler,
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub(crate) max_request_line_bytes: usize,

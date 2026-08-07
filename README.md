@@ -30,6 +30,7 @@ synchttp = "0.1.0"
 - `Transfer-Encoding: chunked` request bodies
 - Keep-alive and pipelining support
 - Exact-path routing with `404` and `405` handling
+- Connection-scoped error handling: one client's I/O error never stops the server
 - Property tests and live integration tests
 
 ## Example
