@@ -3,25 +3,7 @@ use std::borrow::Cow;
 use crate::Request;
 
 /// Returns an iterator over the percent-decoded `name=value` pairs in the
-/// request's query string.
-///
-/// Decoding follows the `application/x-www-form-urlencoded` rules that browsers
-/// and HTTP clients apply to query strings: `%XX` escapes are decoded and `+`
-/// becomes a space. Empty segments are skipped, a segment without `=` yields an
-/// empty value, malformed escapes are passed through unchanged, and bytes that
-/// are not valid UTF-8 once decoded are replaced with U+FFFD.
-///
-/// Note the `+` rule: a value that must carry a literal `+` — a timestamp with a
-/// `+01:00` UTC offset, for instance — has to arrive as `%2B`, or it decodes to a
-/// space.
-///
-/// ```
-/// # let mut request = synchttp::Request::new(Vec::new());
-/// # *request.uri_mut() = "/search?q=hello+world&page=2".parse().unwrap();
-/// let pairs: Vec<_> = synchttp::query_pairs(&request).collect();
-/// assert_eq!(pairs[0], ("q".into(), "hello world".into()));
-/// assert_eq!(pairs[1], ("page".into(), "2".into()));
-/// ```
+/// request's query string. Follows the `application/x-www-form-urlencoded' rules.
 pub fn query_pairs<'a>(
     request: &'a Request,
 ) -> impl Iterator<Item = (Cow<'a, str>, Cow<'a, str>)> + 'a {
@@ -30,19 +12,6 @@ pub fn query_pairs<'a>(
 
 /// Returns the percent-decoded value of the first query parameter named `name`,
 /// decoded as described on [`query_pairs`].
-///
-/// `None` means the request has no query string or no parameter with that name.
-/// A parameter that is present but empty gives `Some("")`.
-///
-/// ```
-/// # let mut request = synchttp::Request::new(Vec::new());
-/// # *request.uri_mut() = "/events?since=2026-02-05T12%3A34%3A56Z".parse().unwrap();
-/// assert_eq!(
-///     synchttp::query_param(&request, "since").unwrap(),
-///     "2026-02-05T12:34:56Z",
-/// );
-/// assert!(synchttp::query_param(&request, "missing").is_none());
-/// ```
 pub fn query_param<'a>(request: &'a Request, name: &str) -> Option<Cow<'a, str>> {
     query_pairs(request)
         .find(|(key, _)| key == name)
