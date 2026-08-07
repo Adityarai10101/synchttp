@@ -31,6 +31,7 @@ synchttp = "0.1.0"
 - Keep-alive and pipelining support
 - Exact-path routing with `404` and `405` handling
 - Connection-scoped error handling: one client's I/O error never stops the server
+- Percent-decoding query string accessors (`query_param`, `query_pairs`)
 - Property tests and live integration tests
 
 ## Example

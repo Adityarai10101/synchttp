@@ -9,6 +9,7 @@ repository = "https://github.com/therishidesai/synchttp"
 readme = "README.md"
 
 [dependencies]
+form_urlencoded = "1"
 http = "1"
 httparse = "1"
 mio = { version = "0.8", features = ["net", "os-poll"] }
