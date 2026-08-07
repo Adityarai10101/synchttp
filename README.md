@@ -30,6 +30,7 @@ synchttp = "0.1.0"
 - `Transfer-Encoding: chunked` request bodies
 - Keep-alive and pipelining support
 - Exact-path routing with `404` and `405` handling
+- Percent-decoding query string accessors (`query_param`, `query_pairs`)
 - Property tests and live integration tests
 
 ## Example
